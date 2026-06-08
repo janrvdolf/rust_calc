@@ -7,9 +7,7 @@
 
 use eframe::{egui, epi};
 use rust_calc::utils::format;
-//use egui;
-//use epi;
-//use eframe;
+use std::sync::mpsc::{self, Receiver};
 
 
 // ---------------------------------------------------------------------------
@@ -34,6 +32,14 @@ struct CalcApp {
     /// user presses a digit, we start a brand-new expression instead of
     /// appending to the old result.
     result_shown: bool,
+
+    /// True while the background evaluation thread is running.
+    /// The button grid is disabled and a spinner is shown during this time.
+    computing: bool,
+
+    /// The receiving end of the channel used to get the result back from the
+    /// background thread.  `None` when no computation is in progress.
+    result_rx: Option<Receiver<Result<f64, String>>>,
 }
 
 impl Default for CalcApp {
@@ -42,6 +48,8 @@ impl Default for CalcApp {
             expression: String::new(),
             current_input: String::from("0"), // start with a visible zero
             result_shown: false,
+            computing: false,
+            result_rx: None,
         }
     }
 }
@@ -151,6 +159,29 @@ impl epi::App for CalcApp {
     /// Here we build the entire UI from the current state.  Any button press
     /// mutates `self` and the change is reflected immediately on the next frame.
     fn update(&mut self, ctx: &egui::Context, _frame: &epi::Frame) {
+        // --- Poll the background thread result channel ---
+        // `try_recv` is non-blocking: it returns immediately with either the
+        // result or an error indicating the thread has not finished yet.
+        if let Some(rx) = &self.result_rx {
+            if let Ok(result) = rx.try_recv() {
+                // Thread finished — apply result and reset computing state.
+                match result {
+                    Ok(value) => self.current_input = format::format_result(value),
+                    Err(msg)  => self.current_input = msg,
+                }
+                self.expression.clear();
+                self.result_shown = true;
+                self.computing = false;
+                self.result_rx = None;
+            }
+        }
+
+        // While computing, ask egui to keep repainting every frame so the
+        // spinner animation stays smooth even without user input.
+        if self.computing {
+            ctx.request_repaint();
+        }
+
         // The string shown in the display area.
         // While the user is typing, we combine the committed expression with
         // the in-progress digits so the display always shows the full picture.
@@ -170,60 +201,71 @@ impl epi::App for CalcApp {
             // --- Display area ---
             ui.add_space(8.0);
 
-            // Show the current expression in a large heading-size label.
-            // A Label is sufficient here — the user never types into the display.
-            ui.heading(&display_text);
+            // Show the expression and, while computing, an animated spinner
+            // on the same horizontal line to the right of the text.
+            ui.horizontal(|ui| {
+                ui.heading(&display_text);
+                if self.computing {
+                    // `egui::Spinner` is a built-in widget that draws a
+                    // rotating arc — no extra dependencies needed.
+                    ui.add(egui::Spinner::new());
+                }
+            });
 
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
 
             // --- Button grid ---
-            // We use egui::Grid with 4 columns.  Each cell contains one button.
-            egui::Grid::new("calc_grid")
-                .num_columns(4)
-                .spacing([6.0, 6.0]) // horizontal and vertical gap between cells
-                .show(ui, |ui| {
-                    // Button size — all buttons share the same dimensions for a
-                    // clean, uniform look.
-                    let btn_size = egui::vec2(64.0, 48.0);
+            // Wrap the grid in `add_enabled_ui` so all buttons are visually
+            // greyed out and non-interactive while computing.
+            ui.add_enabled_ui(!self.computing, |ui| {
+                // We use egui::Grid with 4 columns.  Each cell contains one button.
+                egui::Grid::new("calc_grid")
+                    .num_columns(4)
+                    .spacing([6.0, 6.0]) // horizontal and vertical gap between cells
+                    .show(ui, |ui| {
+                        // Button size — all buttons share the same dimensions for a
+                        // clean, uniform look.
+                        let btn_size = egui::vec2(64.0, 48.0);
 
-                    // Helper macro-like inline: creates a button and returns
-                    // whether it was clicked this frame.
-                    macro_rules! btn {
-                        ($label:expr) => {
-                            ui.add_sized(btn_size, egui::Button::new($label)).clicked()
-                        };
-                    }
+                        // Helper macro: creates a uniformly sized button and
+                        // returns true if clicked this frame.
+                        macro_rules! btn {
+                            ($label:expr) => {
+                                ui.add_sized(btn_size, egui::Button::new($label)).clicked()
+                            };
+                        }
 
-                    // Row 1 — 7, 8, 9, ÷
-                    if btn!("7") { self.press_digit('7'); }
-                    if btn!("8") { self.press_digit('8'); }
-                    if btn!("9") { self.press_digit('9'); }
-                    if btn!("÷") { self.press_operator('/'); }
-                    ui.end_row();
+                        // Row 1 — 7, 8, 9, ÷
+                        if btn!("7") { self.press_digit('7'); }
+                        if btn!("8") { self.press_digit('8'); }
+                        if btn!("9") { self.press_digit('9'); }
+                        if btn!("÷") { self.press_operator('/'); }
+                        ui.end_row();
 
-                    // Row 2 — 4, 5, 6, ×
-                    if btn!("4") { self.press_digit('4'); }
-                    if btn!("5") { self.press_digit('5'); }
-                    if btn!("6") { self.press_digit('6'); }
-                    if btn!("×") { self.press_operator('*'); }
-                    ui.end_row();
+                        // Row 2 — 4, 5, 6, ×
+                        if btn!("4") { self.press_digit('4'); }
+                        if btn!("5") { self.press_digit('5'); }
+                        if btn!("6") { self.press_digit('6'); }
+                        if btn!("×") { self.press_operator('*'); }
+                        ui.end_row();
 
-                    // Row 3 — 1, 2, 3, −
-                    if btn!("1") { self.press_digit('1'); }
-                    if btn!("2") { self.press_digit('2'); }
-                    if btn!("3") { self.press_digit('3'); }
-                    if btn!("−") { self.press_operator('-'); }
-                    ui.end_row();
+                        // Row 3 — 1, 2, 3, −
+                        if btn!("1") { self.press_digit('1'); }
+                        if btn!("2") { self.press_digit('2'); }
+                        if btn!("3") { self.press_digit('3'); }
+                        if btn!("−") { self.press_operator('-'); }
+                        ui.end_row();
 
-                    // Row 4 — 0, C (clear), =, +
-                    if btn!("0") { self.press_digit('0'); }
-                    if btn!("C") { self.press_clear(); }
-                    if btn!("=") { self.press_equals(); }
-                    if btn!("+") { self.press_operator('+'); }
-                    ui.end_row();
-                });
+                        // Row 4 — 0, C (clear), =, +
+                        if btn!("0") { self.press_digit('0'); }
+                        if btn!("C") { self.press_clear(); }
+                        if btn!("=") { self.press_equals(); }
+                        if btn!("+") { self.press_operator('+'); }
+                        ui.end_row();
+                    });
+            });
         });
     }
 }
@@ -276,14 +318,19 @@ impl CalcApp {
         self.current_input.clear();
     }
 
-    /// Handle the `=` button press — evaluate the full expression.
+    /// Handle the `=` button press — kick off evaluation on a background thread.
     fn press_equals(&mut self) {
         // Nothing to evaluate if there is no expression and no input.
         if self.expression.is_empty() && self.current_input.is_empty() {
             return;
         }
 
-        // Build the complete expression string to evaluate.
+        // Ignore repeated presses while a computation is already running.
+        if self.computing {
+            return;
+        }
+
+        // Build the complete expression string to hand to the worker thread.
         let full = if self.expression.is_empty() {
             // User pressed = without any operator — just echo the number.
             self.current_input.clone()
@@ -297,27 +344,33 @@ impl CalcApp {
             format!("{} {}", self.expression, last)
         };
 
-        // Evaluate and display the result (or an error message).
-        match evaluate(&full) {
-            Ok(value) => {
-                self.expression.clear();
-                self.current_input = format::format_result(value);
-            }
-            Err(msg) => {
-                self.expression.clear();
-                self.current_input = msg;
-            }
-        }
+        // Create a one-shot channel.  The worker sends exactly one message.
+        let (tx, rx) = mpsc::channel();
+        self.result_rx = Some(rx);
+        self.computing = true;
 
-        // Mark that a result is showing so the next digit starts fresh.
-        self.result_shown = true;
+        // Spawn the worker thread.  It sleeps for 2 s so the spinner is
+        // visible, then evaluates the expression and sends the result back.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let result = evaluate(&full);
+            // If the receiver was dropped (e.g. user pressed C), this is a
+            // no-op — the send error is intentionally ignored.
+            let _ = tx.send(result);
+        });
     }
 
     /// Handle the `C` (clear) button — reset the calculator to its initial state.
+    ///
+    /// Dropping `result_rx` causes the background thread's `send()` to fail
+    /// silently, so the thread still runs to completion but its result is
+    /// discarded.
     fn press_clear(&mut self) {
         self.expression.clear();
         self.current_input = String::from("0");
         self.result_shown = false;
+        self.computing = false;
+        self.result_rx = None; // dropping the Receiver cancels the pending result
     }
 }
 
