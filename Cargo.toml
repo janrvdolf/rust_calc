@@ -1,0 +1,11 @@
+[package]
+name = "rust_calc"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+eframe = "0.17"
+egui = "0.34"
+epi = "0.17"
