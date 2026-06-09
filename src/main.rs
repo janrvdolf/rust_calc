@@ -140,7 +140,51 @@ fn evaluate(expression: &str) -> Result<f64, String> {
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// Button grid
+// ---------------------------------------------------------------------------
 
+/// What happens when a calculator button is pressed.
+#[derive(Copy, Clone)]
+enum CalcButtonAction {
+    Digit(char),
+    Operator(char),
+    Clear,
+    Equals,
+}
+
+/// 4×4 button layout: display label and the action it triggers.
+const BUTTON_ROWS: &[[(&str, CalcButtonAction); 4]] = &[
+    [
+        ("7", CalcButtonAction::Digit('7')),
+        ("8", CalcButtonAction::Digit('8')),
+        ("9", CalcButtonAction::Digit('9')),
+        ("÷", CalcButtonAction::Operator('/')),
+    ],
+    [
+        ("4", CalcButtonAction::Digit('4')),
+        ("5", CalcButtonAction::Digit('5')),
+        ("6", CalcButtonAction::Digit('6')),
+        ("×", CalcButtonAction::Operator('*')),
+    ],
+    [
+        ("1", CalcButtonAction::Digit('1')),
+        ("2", CalcButtonAction::Digit('2')),
+        ("3", CalcButtonAction::Digit('3')),
+        ("−", CalcButtonAction::Operator('-')),
+    ],
+    [
+        ("0", CalcButtonAction::Digit('0')),
+        ("C", CalcButtonAction::Clear),
+        ("=", CalcButtonAction::Equals),
+        ("+", CalcButtonAction::Operator('+')),
+    ],
+];
+
+/// Draw a uniformly sized calculator button; returns `true` if clicked this frame.
+fn calc_button(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> bool {
+    ui.add_sized(size, egui::Button::new(label)).clicked()
+}
 
 // ---------------------------------------------------------------------------
 // eframe application impl
@@ -225,45 +269,16 @@ impl epi::App for CalcApp {
                     .num_columns(4)
                     .spacing([6.0, 6.0]) // horizontal and vertical gap between cells
                     .show(ui, |ui| {
-                        // Button size — all buttons share the same dimensions for a
-                        // clean, uniform look.
                         let btn_size = egui::vec2(64.0, 48.0);
 
-                        // Helper macro: creates a uniformly sized button and
-                        // returns true if clicked this frame.
-                        macro_rules! btn {
-                            ($label:expr) => {
-                                ui.add_sized(btn_size, egui::Button::new($label)).clicked()
-                            };
+                        for row in BUTTON_ROWS {
+                            for (label, action) in row {
+                                if calc_button(ui, btn_size, label) {
+                                    self.dispatch(*action);
+                                }
+                            }
+                            ui.end_row();
                         }
-
-                        // Row 1 — 7, 8, 9, ÷
-                        if btn!("7") { self.press_digit('7'); }
-                        if btn!("8") { self.press_digit('8'); }
-                        if btn!("9") { self.press_digit('9'); }
-                        if btn!("÷") { self.press_operator('/'); }
-                        ui.end_row();
-
-                        // Row 2 — 4, 5, 6, ×
-                        if btn!("4") { self.press_digit('4'); }
-                        if btn!("5") { self.press_digit('5'); }
-                        if btn!("6") { self.press_digit('6'); }
-                        if btn!("×") { self.press_operator('*'); }
-                        ui.end_row();
-
-                        // Row 3 — 1, 2, 3, −
-                        if btn!("1") { self.press_digit('1'); }
-                        if btn!("2") { self.press_digit('2'); }
-                        if btn!("3") { self.press_digit('3'); }
-                        if btn!("−") { self.press_operator('-'); }
-                        ui.end_row();
-
-                        // Row 4 — 0, C (clear), =, +
-                        if btn!("0") { self.press_digit('0'); }
-                        if btn!("C") { self.press_clear(); }
-                        if btn!("=") { self.press_equals(); }
-                        if btn!("+") { self.press_operator('+'); }
-                        ui.end_row();
                     });
             });
         });
@@ -275,6 +290,15 @@ impl epi::App for CalcApp {
 // ---------------------------------------------------------------------------
 
 impl CalcApp {
+    fn dispatch(&mut self, action: CalcButtonAction) {
+        match action {
+            CalcButtonAction::Digit(d) => self.press_digit(d),
+            CalcButtonAction::Operator(op) => self.press_operator(op),
+            CalcButtonAction::Clear => self.press_clear(),
+            CalcButtonAction::Equals => self.press_equals(),
+        }
+    }
+
     /// Handle a digit button press (`0`–`9`).
     fn press_digit(&mut self, digit: char) {
         // If the previous action was `=`, start a fresh expression.
