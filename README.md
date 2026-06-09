@@ -4,7 +4,11 @@ A simple desktop calculator built with Rust and [egui](https://github.com/emilk/
 
 The display shows the entire math expression as you build it (e.g. `12 + 7 * 3`), with correct operator precedence (`*` and `/` before `+` and `-`). Pressing `=` evaluates and shows the result; `C` resets everything.
 
-![Calculator screenshot](docs/screenshot.png)
+<div align="center">
+
+![Calculator screenshot](docs/screenshot.png =300x)
+
+</div>
 
 ## Features
 
