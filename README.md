@@ -6,7 +6,7 @@ The display shows the entire math expression as you build it (e.g. `12 + 7 * 3`)
 
 <div align="center">
 
-![Calculator screenshot](docs/screenshot.png =300x)
+![Calculator screenshot](docs/screenshot.png)
 
 </div>
 
