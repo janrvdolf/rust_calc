@@ -7,7 +7,7 @@
 
 use eframe::{egui, epi};
 use rust_calc::utils::format;
-use std::sync::mpsc::{self, Receiver};
+use rust_calc::worker::EvalWorker;
 
 
 // ---------------------------------------------------------------------------
@@ -33,13 +33,12 @@ struct CalcApp {
     /// appending to the old result.
     result_shown: bool,
 
-    /// True while the background evaluation thread is running.
+    /// True while the worker thread is evaluating an expression.
     /// The button grid is disabled and a spinner is shown during this time.
     computing: bool,
 
-    /// The receiving end of the channel used to get the result back from the
-    /// background thread.  `None` when no computation is in progress.
-    result_rx: Option<Receiver<Result<f64, String>>>,
+    /// Persistent background worker that evaluates expressions.
+    worker: EvalWorker,
 }
 
 impl Default for CalcApp {
@@ -49,98 +48,102 @@ impl Default for CalcApp {
             current_input: String::from("0"), // start with a visible zero
             result_shown: false,
             computing: false,
-            result_rx: None,
+            worker: EvalWorker::spawn(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Evaluation logic
+// Button grid
 // ---------------------------------------------------------------------------
 
-/// Evaluate a fully-built expression string such as `"12 + 7 * 3 - 1"`.
-///
-/// The expression must follow the pattern:
-///   `number (operator number)*`
-/// where tokens are separated by single spaces.
-///
-/// Operator precedence is handled with two passes:
-///   1. Resolve all `*` and `/` left-to-right.
-///   2. Resolve all `+` and `-` left-to-right.
-///
-/// Returns `Ok(result)` or `Err(message)` (e.g. for division by zero or a
-/// malformed expression).
-fn evaluate(expression: &str) -> Result<f64, String> {
-    // Split the expression into tokens: numbers and operators alternate.
-    // Example: "12 + 7 * 3" → ["12", "+", "7", "*", "3"]
-    let tokens: Vec<&str> = expression.split_whitespace().collect();
-
-    if tokens.is_empty() {
-        return Err("Empty expression".to_string());
-    }
-
-    // --- First pass: parse all tokens into a flat list while immediately
-    // applying `*` and `/`. ---
-    //
-    // `numbers` accumulates the operands that still need `+` / `-` applied.
-    // `ops` accumulates the corresponding `+` / `-` operators between them.
-    let mut numbers: Vec<f64> = Vec::new();
-    let mut ops: Vec<char> = Vec::new();
-
-    // The first token must be a number.
-    let first: f64 = tokens[0]
-        .parse()
-        .map_err(|_| format!("Cannot parse '{}'", tokens[0]))?;
-
-    // `acc` is the running product/quotient for the current `*`/`/` chain.
-    let mut acc = first;
-
-    // Walk the remaining tokens two at a time: operator then operand.
-    let mut i = 1;
-    while i + 1 <= tokens.len() - 1 {
-        let op = tokens[i];
-        let num: f64 = tokens[i + 1]
-            .parse()
-            .map_err(|_| format!("Cannot parse '{}'", tokens[i + 1]))?;
-
-        match op {
-            "*" => acc *= num,
-            "/" => {
-                if num == 0.0 {
-                    return Err("Div by zero".to_string());
-                }
-                acc /= num;
-            }
-            // For `+` or `-` we commit the current accumulator to the list
-            // and start a new accumulator for the next `*`/`/` chain.
-            "+" | "-" => {
-                numbers.push(acc);
-                ops.push(op.chars().next().unwrap());
-                acc = num;
-            }
-            unknown => return Err(format!("Unknown op '{}'", unknown)),
-        }
-
-        i += 2; // advance past the operator and the operand we just consumed
-    }
-
-    // Push the last accumulated value.
-    numbers.push(acc);
-
-    // --- Second pass: apply `+` and `-` left-to-right. ---
-    let mut result = numbers[0];
-    for (op, &n) in ops.iter().zip(numbers[1..].iter()) {
-        match op {
-            '+' => result += n,
-            '-' => result -= n,
-            _ => unreachable!(), // only + and - reach this pass
-        }
-    }
-
-    Ok(result)
+/// What happens when a calculator button is pressed.
+#[derive(Copy, Clone)]
+enum CalcButtonAction {
+    Digit(char),
+    Operator(char),
+    Clear,
+    Equals,
 }
 
+/// 4×4 button layout: display label and the action it triggers.
+const BUTTON_ROWS: &[[(&str, CalcButtonAction); 4]] = &[
+    [
+        ("7", CalcButtonAction::Digit('7')),
+        ("8", CalcButtonAction::Digit('8')),
+        ("9", CalcButtonAction::Digit('9')),
+        ("÷", CalcButtonAction::Operator('/')),
+    ],
+    [
+        ("4", CalcButtonAction::Digit('4')),
+        ("5", CalcButtonAction::Digit('5')),
+        ("6", CalcButtonAction::Digit('6')),
+        ("×", CalcButtonAction::Operator('*')),
+    ],
+    [
+        ("1", CalcButtonAction::Digit('1')),
+        ("2", CalcButtonAction::Digit('2')),
+        ("3", CalcButtonAction::Digit('3')),
+        ("−", CalcButtonAction::Operator('-')),
+    ],
+    [
+        ("0", CalcButtonAction::Digit('0')),
+        ("C", CalcButtonAction::Clear),
+        ("=", CalcButtonAction::Equals),
+        ("+", CalcButtonAction::Operator('+')),
+    ],
+];
 
+/// Draw a uniformly sized calculator button; returns `true` if clicked this frame.
+/// The equals button uses a pill shape with fully rounded ends.
+fn calc_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    label: &str,
+    action: CalcButtonAction,
+) -> bool {
+    if matches!(action, CalcButtonAction::Equals) {
+        // matches! is a macro equivalent to the following:
+        // if match action {
+        //     CalcButtonAction::Equals => {
+        //         equals_button(ui, size, label)
+        //     }
+        //     _ => {
+        //         ui.add_sized(size, egui::Button::new(label)).clicked()
+        //     }
+        // }
+        equals_button(ui, size, label)
+    } else {
+        ui.add_sized(size, egui::Button::new(label)).clicked()
+    }
+}
+
+fn equals_button(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> bool {
+    let rounding = egui::Rounding::same(size.y * 0.5);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, label));
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        ui.painter().rect(
+            rect.expand(visuals.expansion),
+            rounding,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+        );
+
+        let text = egui::WidgetText::from(label)
+            .into_galley(ui, None, f32::INFINITY, egui::TextStyle::Button);
+        let text_pos = ui
+            .layout()
+            .align_size_within_rect(text.size(), rect)
+            .min;
+        text.paint_with_visuals(ui.painter(), text_pos, visuals);
+    }
+
+    response.clicked()
+}
 
 // ---------------------------------------------------------------------------
 // eframe application impl
@@ -159,20 +162,16 @@ impl epi::App for CalcApp {
     /// Here we build the entire UI from the current state.  Any button press
     /// mutates `self` and the change is reflected immediately on the next frame.
     fn update(&mut self, ctx: &egui::Context, _frame: &epi::Frame) {
-        // --- Poll the background thread result channel ---
-        // `try_recv` is non-blocking: it returns immediately with either the
-        // result or an error indicating the thread has not finished yet.
-        if let Some(rx) = &self.result_rx {
-            if let Ok(result) = rx.try_recv() {
-                // Thread finished — apply result and reset computing state.
+        // --- Poll the worker for a completed result ---
+        if let Some(result) = self.worker.try_recv() {
+            if self.computing {
                 match result {
                     Ok(value) => self.current_input = format::format_result(value),
-                    Err(msg)  => self.current_input = msg,
+                    Err(msg) => self.current_input = msg,
                 }
                 self.expression.clear();
                 self.result_shown = true;
                 self.computing = false;
-                self.result_rx = None;
             }
         }
 
@@ -225,45 +224,16 @@ impl epi::App for CalcApp {
                     .num_columns(4)
                     .spacing([6.0, 6.0]) // horizontal and vertical gap between cells
                     .show(ui, |ui| {
-                        // Button size — all buttons share the same dimensions for a
-                        // clean, uniform look.
                         let btn_size = egui::vec2(64.0, 48.0);
 
-                        // Helper macro: creates a uniformly sized button and
-                        // returns true if clicked this frame.
-                        macro_rules! btn {
-                            ($label:expr) => {
-                                ui.add_sized(btn_size, egui::Button::new($label)).clicked()
-                            };
+                        for row in BUTTON_ROWS {
+                            for (label, action) in row {
+                                if calc_button(ui, btn_size, label, *action) {
+                                    self.dispatch(*action);
+                                }
+                            }
+                            ui.end_row();
                         }
-
-                        // Row 1 — 7, 8, 9, ÷
-                        if btn!("7") { self.press_digit('7'); }
-                        if btn!("8") { self.press_digit('8'); }
-                        if btn!("9") { self.press_digit('9'); }
-                        if btn!("÷") { self.press_operator('/'); }
-                        ui.end_row();
-
-                        // Row 2 — 4, 5, 6, ×
-                        if btn!("4") { self.press_digit('4'); }
-                        if btn!("5") { self.press_digit('5'); }
-                        if btn!("6") { self.press_digit('6'); }
-                        if btn!("×") { self.press_operator('*'); }
-                        ui.end_row();
-
-                        // Row 3 — 1, 2, 3, −
-                        if btn!("1") { self.press_digit('1'); }
-                        if btn!("2") { self.press_digit('2'); }
-                        if btn!("3") { self.press_digit('3'); }
-                        if btn!("−") { self.press_operator('-'); }
-                        ui.end_row();
-
-                        // Row 4 — 0, C (clear), =, +
-                        if btn!("0") { self.press_digit('0'); }
-                        if btn!("C") { self.press_clear(); }
-                        if btn!("=") { self.press_equals(); }
-                        if btn!("+") { self.press_operator('+'); }
-                        ui.end_row();
                     });
             });
         });
@@ -275,6 +245,15 @@ impl epi::App for CalcApp {
 // ---------------------------------------------------------------------------
 
 impl CalcApp {
+    fn dispatch(&mut self, action: CalcButtonAction) {
+        match action {
+            CalcButtonAction::Digit(d) => self.press_digit(d),
+            CalcButtonAction::Operator(op) => self.press_operator(op),
+            CalcButtonAction::Clear => self.press_clear(),
+            CalcButtonAction::Equals => self.press_equals(),
+        }
+    }
+
     /// Handle a digit button press (`0`–`9`).
     fn press_digit(&mut self, digit: char) {
         // If the previous action was `=`, start a fresh expression.
@@ -318,7 +297,7 @@ impl CalcApp {
         self.current_input.clear();
     }
 
-    /// Handle the `=` button press — kick off evaluation on a background thread.
+    /// Handle the `=` button press — submit evaluation to the worker thread.
     fn press_equals(&mut self) {
         // Nothing to evaluate if there is no expression and no input.
         if self.expression.is_empty() && self.current_input.is_empty() {
@@ -344,33 +323,20 @@ impl CalcApp {
             format!("{} {}", self.expression, last)
         };
 
-        // Create a one-shot channel.  The worker sends exactly one message.
-        let (tx, rx) = mpsc::channel();
-        self.result_rx = Some(rx);
         self.computing = true;
-
-        // Spawn the worker thread.  It sleeps for 2 s so the spinner is
-        // visible, then evaluates the expression and sends the result back.
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let result = evaluate(&full);
-            // If the receiver was dropped (e.g. user pressed C), this is a
-            // no-op — the send error is intentionally ignored.
-            let _ = tx.send(result);
-        });
+        self.worker.submit(full);
     }
 
     /// Handle the `C` (clear) button — reset the calculator to its initial state.
     ///
-    /// Dropping `result_rx` causes the background thread's `send()` to fail
-    /// silently, so the thread still runs to completion but its result is
-    /// discarded.
+    /// Any result still in the channel is drained so a late worker reply is
+    /// not applied after clear.
     fn press_clear(&mut self) {
         self.expression.clear();
         self.current_input = String::from("0");
         self.result_shown = false;
         self.computing = false;
-        self.result_rx = None; // dropping the Receiver cancels the pending result
+        self.worker.drain_results();
     }
 }
 
