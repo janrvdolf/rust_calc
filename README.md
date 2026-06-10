@@ -56,8 +56,6 @@ cargo build --release
 #   Windows:      target\release\rust_calc.exe
 ```
 
----
-
 <!--
 ## Deployment
 
